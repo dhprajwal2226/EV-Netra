@@ -1,7 +1,46 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+"""
+EV-Netra — FastAPI Backend
+Run: uvicorn main:app --reload --port 8000
+"""
 
-app = FastAPI(title="EV-Netra API")
+import sqlite3
+import math
+import random
+from datetime import datetime, timedelta
+from typing import Optional
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# ── H3 import with stub fallback ──────────────────────────────────────────────
+try:
+    import h3 as _h3
+    def cell_to_boundary(cell_id):
+        boundary = _h3.cell_to_boundary(cell_id)
+        return [[lat, lng] for lat, lng in boundary]
+    def grid_disk(cell_id, k):
+        return list(_h3.grid_disk(cell_id, k))
+    H3_AVAILABLE = True
+except ImportError:
+    H3_AVAILABLE = False
+    def cell_to_boundary(cell_id):
+        # Return a dummy hexagon boundary for stub IDs
+        parts = cell_id.replace("stub_", "").split("_")
+        if len(parts) < 3:
+            return []
+        res = int(parts[0])
+        lat = float(parts[1]) / (2 ** res)
+        lng = float(parts[2]) / (2 ** res)
+        d = 0.003
+        return [
+            [lat+d, lng], [lat+d/2, lng+d], [lat-d/2, lng+d],
+            [lat-d, lng], [lat-d/2, lng-d], [lat+d/2, lng-d],
+        ]
+    def grid_disk(cell_id, k):
+        return [cell_id]
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+app = FastAPI(title="EV-Netra API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -10,6 +49,530 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+DB_PATH = "data/ev_data.db"
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 1 — Health check
+# ─────────────────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "message": "EV-Netra backend running"}
+    return {"status": "ok", "h3_available": H3_AVAILABLE}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 2 — GET /api/hex-demand
+# Returns all hex cells with demand scores, optionally filtered by hour.
+# The React map calls this to colour each hexagon green/amber/red.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/hex-demand")
+def hex_demand(hour: Optional[int] = None):
+    conn = get_db()
+    try:
+        if hour is not None:
+            rows = conn.execute(
+                """
+                SELECT hex_id_r8, zone_name, hour,
+                       COUNT(*) as sessions,
+                       SUM(kwh)  as total_kwh,
+                       AVG(grid_load_pct) as avg_grid_load
+                FROM charging_events
+                WHERE hour = ?
+                GROUP BY hex_id_r8, hour
+                """,
+                (hour,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT hex_id_r8, zone_name, hour,
+                       COUNT(*) as sessions,
+                       SUM(kwh)  as total_kwh,
+                       AVG(grid_load_pct) as avg_grid_load
+                FROM charging_events
+                GROUP BY hex_id_r8, hour
+                """
+            ).fetchall()
+
+        # Normalise demand score 0–1
+        if not rows:
+            return []
+        max_sessions = max(r["sessions"] for r in rows) or 1
+
+        result = []
+        for r in rows:
+            score = round(r["sessions"] / max_sessions, 3)
+            boundary = cell_to_boundary(r["hex_id_r8"])
+            result.append({
+                "hex_id":       r["hex_id_r8"],
+                "zone_name":    r["zone_name"],
+                "hour":         r["hour"],
+                "sessions":     r["sessions"],
+                "total_kwh":    round(r["total_kwh"], 1),
+                "demand_score": score,
+                "grid_load_pct": round(r["avg_grid_load"], 1),
+                "boundary":     boundary,
+                "color":        "red" if score > 0.7 else ("amber" if score > 0.4 else "green"),
+            })
+        return result
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 3 — GET /api/forecast/{hex_id}
+# 24-hour demand prediction for a single hex cell.
+# Uses Prophet if available, else a sine-wave heuristic.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/forecast/{hex_id}")
+def forecast(hex_id: str):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT hour, COUNT(*) as sessions, SUM(kwh) as total_kwh
+            FROM charging_events
+            WHERE hex_id_r8 = ?
+            GROUP BY hour
+            ORDER BY hour
+            """,
+            (hex_id,)
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(status_code=404, detail="Hex ID not found")
+
+        # Build lookup for actual historical data
+        historical = {r["hour"]: {"sessions": r["sessions"], "kwh": r["total_kwh"]}
+                      for r in rows}
+
+        try:
+            from prophet import Prophet
+            import pandas as pd
+
+            # Build a daily timeseries from the historical hourly data
+            base = datetime(2024, 12, 1)
+            ts_rows = []
+            for day in range(30):
+                for hour in range(24):
+                    kwh = historical.get(hour, {}).get("kwh", 0)
+                    noise = random.gauss(0, kwh * 0.1 + 0.5)
+                    ts_rows.append({
+                        "ds": base + timedelta(days=day, hours=hour),
+                        "y":  max(0, kwh + noise)
+                    })
+            df = pd.DataFrame(ts_rows)
+            m  = Prophet(daily_seasonality=True, yearly_seasonality=False,
+                          weekly_seasonality=True, interval_width=0.80)
+            m.fit(df)
+            future = m.make_future_dataframe(periods=24, freq="h")
+            fcst   = m.predict(future).tail(24)
+
+            predictions = []
+            for i, (_, frow) in enumerate(fcst.iterrows()):
+                predictions.append({
+                    "hour":             i,
+                    "predicted_kwh":    round(max(0, frow["yhat"]), 2),
+                    "confidence_low":   round(max(0, frow["yhat_lower"]), 2),
+                    "confidence_high":  round(max(0, frow["yhat_upper"]), 2),
+                    "is_peak":          (6 <= i <= 9) or (18 <= i <= 21),
+                    "off_peak_discount": 15 if i < 6 or i >= 22 else (8 if 10 <= i <= 14 else 0),
+                })
+            return {"hex_id": hex_id, "model": "prophet", "predictions": predictions}
+
+        except ImportError:
+            # Fallback: sine-wave heuristic based on historical averages
+            avg_kwh = sum(v["kwh"] for v in historical.values()) / max(len(historical), 1)
+            predictions = []
+            for hour in range(24):
+                hist_kwh = historical.get(hour, {}).get("kwh", avg_kwh * 0.3)
+                noise    = random.gauss(0, hist_kwh * 0.12)
+                pred     = max(0, hist_kwh + noise)
+                ci_width = pred * 0.25
+                predictions.append({
+                    "hour":             hour,
+                    "predicted_kwh":    round(pred, 2),
+                    "confidence_low":   round(max(0, pred - ci_width), 2),
+                    "confidence_high":  round(pred + ci_width, 2),
+                    "is_peak":          (6 <= hour <= 9) or (18 <= hour <= 21),
+                    "off_peak_discount": 15 if hour < 6 or hour >= 22 else (8 if 10 <= hour <= 14 else 0),
+                })
+            return {"hex_id": hex_id, "model": "heuristic", "predictions": predictions}
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 4 — POST /api/schedule
+# Optimal off-peak charging windows for a zone.
+# ─────────────────────────────────────────────────────────────────────────────
+class ScheduleRequest(BaseModel):
+    hex_id: str
+    date:   Optional[str] = None
+
+@app.post("/api/schedule")
+def schedule(req: ScheduleRequest):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT hour, COUNT(*) as sessions, AVG(grid_load_pct) as avg_load
+            FROM charging_events
+            WHERE hex_id_r8 = ?
+            GROUP BY hour ORDER BY hour
+            """,
+            (req.hex_id,)
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(status_code=404, detail="Hex ID not found")
+
+        hour_data = {r["hour"]: {"sessions": r["sessions"], "avg_load": r["avg_load"]}
+                     for r in rows}
+
+        # Calculate grid surplus and identify windows
+        windows = []
+        for hour in range(24):
+            load = hour_data.get(hour, {}).get("avg_load", 50)
+            surplus = 100 - load
+            demand  = hour_data.get(hour, {}).get("sessions", 0)
+            demand_norm = demand / max(r["sessions"] for r in rows) if rows else 0
+
+            # Good window = high surplus AND low demand
+            window_score = surplus * 0.6 + (1 - demand_norm) * 40
+
+            if surplus > 40 and demand_norm < 0.5:
+                discount = 15 if surplus > 60 else 8
+                windows.append({
+                    "hour":          hour,
+                    "time_label":    f"{hour:02d}:00 – {(hour+1)%24:02d}:00",
+                    "grid_surplus_pct": round(surplus, 1),
+                    "demand_norm":   round(demand_norm, 3),
+                    "window_score":  round(window_score, 1),
+                    "discount_pct":  discount,
+                    "incentive_label": f"₹{discount}% off per unit",
+                    "recommendation": "Ideal" if surplus > 60 else "Good",
+                })
+
+        # Sort by score descending
+        windows.sort(key=lambda x: x["window_score"], reverse=True)
+
+        # Group into contiguous blocks
+        all_sessions = sum(r["sessions"] for r in rows)
+        peak_sessions = sum(
+            hour_data.get(h, {}).get("sessions", 0)
+            for h in range(24)
+            if (6 <= h <= 9) or (18 <= h <= 21)
+        )
+        peak_pct = (peak_sessions / all_sessions * 100) if all_sessions else 0
+        potential_reduction = min(35, peak_pct * 0.4)
+
+        return {
+            "hex_id":               req.hex_id,
+            "windows":              windows[:6],          # top 6 windows
+            "total_windows_found":  len(windows),
+            "peak_sessions_pct":    round(peak_pct, 1),
+            "potential_peak_reduction_pct": round(potential_reduction, 1),
+            "recommendation_summary": (
+                f"Shifting {round(potential_reduction)}% of demand to off-peak windows "
+                f"could reduce grid stress by ~{round(potential_reduction * 0.8)}%."
+            )
+        }
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 5 — GET /api/sites/recommend
+# Ranked list of hexes with high demand but no nearby station.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/sites/recommend")
+def sites_recommend(limit: int = 15):
+    conn = get_db()
+    try:
+        # Demand by hex
+        demand_rows = conn.execute(
+            """
+            SELECT hex_id_r8, zone_name,
+                   COUNT(*) as sessions,
+                   SUM(kwh) as total_kwh,
+                   AVG(grid_load_pct) as avg_load
+            FROM charging_events
+            GROUP BY hex_id_r8
+            """
+        ).fetchall()
+
+        # Existing stations
+        station_rows = conn.execute(
+            "SELECT hex_id_r8 FROM charging_stations"
+        ).fetchall()
+        station_hexes = {r["hex_id_r8"] for r in station_rows}
+
+        max_sessions = max(r["sessions"] for r in demand_rows) if demand_rows else 1
+
+        recommendations = []
+        for r in demand_rows:
+            demand_score = r["sessions"] / max_sessions
+
+            if demand_score < 0.40:   # skip low-demand hexes
+                continue
+
+            neighbors = grid_disk(r["hex_id_r8"], 1)
+            has_station = any(n in station_hexes for n in neighbors)
+
+            if has_station:
+                continue   # already covered
+
+            # Coverage gap found — score it
+            grid_surplus = 100 - r["avg_load"]
+            growth_proxy = demand_score * 100 * random.uniform(0.8, 1.2)   # simulated growth
+
+            composite_score = (
+                demand_score     * 0.50 +
+                (growth_proxy / 100) * 0.30 +
+                (grid_surplus / 100) * 0.20
+            )
+            boundary = cell_to_boundary(r["hex_id_r8"])
+
+            reasons = [
+                f"{r['sessions']} sessions in last 30 days "
+                f"(+{round(growth_proxy, 0):.0f}% projected growth)",
+                f"No charging station within 1.5 km radius",
+                f"Grid surplus {round(grid_surplus, 0):.0f}% — ready for new load",
+            ]
+
+            recommendations.append({
+                "hex_id":          r["hex_id_r8"],
+                "zone_name":       r["zone_name"],
+                "demand_score":    round(demand_score, 3),
+                "composite_score": round(composite_score, 3),
+                "sessions_30d":    r["sessions"],
+                "total_kwh_30d":   round(r["total_kwh"], 1),
+                "grid_surplus_pct": round(grid_surplus, 1),
+                "reasons":         reasons,
+                "charger_type_rec": "fast_dc" if demand_score > 0.7 else "slow_ac",
+                "estimated_stations_needed": 2 if demand_score > 0.7 else 1,
+                "boundary":        boundary,
+            })
+
+        recommendations.sort(key=lambda x: x["composite_score"], reverse=True)
+        ranked = [{"rank": i + 1, **rec} for i, rec in enumerate(recommendations[:limit])]
+        return {"count": len(ranked), "recommendations": ranked}
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 6 — GET /api/sites/rural
+# High-growth rural taluks needing charging infrastructure.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/sites/rural")
+def sites_rural():
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM rural_taluks ORDER BY ev_growth_pct DESC"
+        ).fetchall()
+        result = []
+        for r in rows:
+            boundary = cell_to_boundary(r["hex_id_r7"])
+            result.append({
+                "taluk":              r["taluk"],
+                "district":           r["district"],
+                "lat":                r["lat"],
+                "lng":                r["lng"],
+                "hex_id":             r["hex_id_r7"],
+                "ev_growth_pct":      r["ev_growth_pct"],
+                "ev_registrations":   r["ev_registrations"],
+                "stations_existing":  r["stations_existing"],
+                "priority":           r["priority"],
+                "boundary":           boundary,
+                "gap_stations_needed": max(0, math.ceil(r["ev_registrations"] / 20) - r["stations_existing"]),
+                "reason":             (
+                    f"{r['ev_growth_pct']}% EV growth — "
+                    f"only {r['stations_existing']} station(s) serving "
+                    f"{r['ev_registrations']} registered EVs"
+                ),
+            })
+        return {"count": len(result), "taluks": result}
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 7 — GET /api/xai/{hex_id}
+# Explainability reasons for why a hex is colored or recommended.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/xai/{hex_id}")
+def xai(hex_id: str):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT zone_name,
+                   COUNT(*) as sessions,
+                   SUM(kwh) as total_kwh,
+                   AVG(grid_load_pct) as avg_load,
+                   MAX(hour) as peak_hour
+            FROM charging_events
+            WHERE hex_id_r8 = ?
+            GROUP BY hex_id_r8
+            """,
+            (hex_id,)
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Hex ID not found")
+
+        # Month-on-month growth simulated
+        prev_month_sessions = int(row["sessions"] * random.uniform(0.7, 0.9))
+        growth_pct = round((row["sessions"] - prev_month_sessions) / max(prev_month_sessions, 1) * 100, 1)
+
+        grid_surplus = round(100 - row["avg_load"], 1)
+        peak_hour_label = f"{int(row['avg_load']//10 + 17):02d}:00"
+
+        # Nearest station
+        stations = conn.execute("SELECT hex_id_r8 FROM charging_stations").fetchall()
+        station_hexes = {s["hex_id_r8"] for s in stations}
+        neighbors_k1 = grid_disk(hex_id, 1)
+        neighbors_k2 = grid_disk(hex_id, 2)
+        has_near = any(n in station_hexes for n in neighbors_k1)
+        has_2km  = any(n in station_hexes for n in neighbors_k2)
+        gap_label = (
+            "Station within 1 km" if has_near else
+            ("Nearest station ~2 km away" if has_2km else "No station within 3 km")
+        )
+
+        # Demand classification
+        all_max = conn.execute("SELECT MAX(c) FROM (SELECT COUNT(*) c FROM charging_events GROUP BY hex_id_r8)").fetchone()[0] or 1
+        demand_score = row["sessions"] / all_max
+        demand_label = "Very high" if demand_score > 0.7 else ("High" if demand_score > 0.4 else ("Moderate" if demand_score > 0.2 else "Low"))
+
+        verdict_map = {
+            "Very high": "Critical — recommend 3+ fast chargers urgently",
+            "High":      "High priority — recommend 2 fast chargers",
+            "Moderate":  "Medium priority — recommend 1 slow AC charger",
+            "Low":       "Monitor — revisit in 3 months",
+        }
+
+        return {
+            "hex_id":    hex_id,
+            "zone_name": row["zone_name"],
+            "demand_level": demand_label,
+            "demand_score": round(demand_score, 3),
+            "reasons": [
+                {
+                    "icon":  "chart",
+                    "title": "Demand signal",
+                    "body":  f"{row['sessions']} sessions in last 30 days "
+                             f"({'+' if growth_pct >= 0 else ''}{growth_pct}% vs prev month). "
+                             f"Total {round(row['total_kwh'], 0):.0f} kWh consumed.",
+                },
+                {
+                    "icon":  "grid",
+                    "title": "Grid status",
+                    "body":  f"Average grid load {round(row['avg_load'], 1)}% — "
+                             f"surplus {grid_surplus}%. "
+                             f"{'Excellent capacity for new chargers.' if grid_surplus > 40 else 'Moderate capacity — battery storage recommended.'}",
+                },
+                {
+                    "icon":  "pin",
+                    "title": "Coverage gap",
+                    "body":  f"{gap_label}. "
+                             f"{'Current coverage is adequate.' if has_near else 'Coverage gap detected — new station recommended.'}",
+                },
+            ],
+            "verdict": verdict_map[demand_label],
+            "action":  "recommend_station" if not has_near and demand_score > 0.3 else "monitor",
+        }
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 8 — GET /api/dashboard/summary
+# KPI summary for the BESCOM planner dashboard.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/dashboard/summary")
+def dashboard_summary():
+    conn = get_db()
+    try:
+        total_events = conn.execute("SELECT COUNT(*) FROM charging_events").fetchone()[0]
+        total_kwh    = conn.execute("SELECT SUM(kwh) FROM charging_events").fetchone()[0] or 0
+        total_hexes  = conn.execute("SELECT COUNT(DISTINCT hex_id_r8) FROM charging_events").fetchone()[0]
+        total_stations = conn.execute("SELECT COUNT(*) FROM charging_stations").fetchone()[0]
+        total_rural_flagged = conn.execute(
+            "SELECT COUNT(*) FROM rural_taluks WHERE priority IN ('high','medium')"
+        ).fetchone()[0]
+
+        # Zone breakdown
+        zone_rows = conn.execute(
+            """
+            SELECT zone_name, COUNT(*) as sessions, SUM(kwh) as kwh
+            FROM charging_events
+            GROUP BY zone_name
+            ORDER BY sessions DESC LIMIT 5
+            """
+        ).fetchall()
+
+        # Simulated metrics
+        peak_load_reduction = 23.4          # % if all scheduling recs applied
+        coverage_pct = round(total_stations / max(total_hexes, 1) * 100, 1)
+        avg_kwh_per_session = round(total_kwh / max(total_events, 1), 1)
+        co2_saved_kg = round(total_kwh * 0.82, 0)   # Karnataka grid emission factor
+
+        return {
+            "total_sessions_30d":    total_events,
+            "total_kwh_30d":         round(total_kwh, 1),
+            "total_hex_zones":       total_hexes,
+            "stations_deployed":     total_stations,
+            "coverage_pct":          coverage_pct,
+            "peak_load_reduction_pct": peak_load_reduction,
+            "rural_taluks_flagged":  total_rural_flagged,
+            "avg_kwh_per_session":   avg_kwh_per_session,
+            "co2_saved_kg":          int(co2_saved_kg),
+            "top_zones": [
+                {
+                    "zone_name": r["zone_name"],
+                    "sessions":  r["sessions"],
+                    "kwh":       round(r["kwh"], 1),
+                }
+                for r in zone_rows
+            ],
+        }
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 9 — GET /api/grid/load
+# Simulated real-time grid load by zone.
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/api/grid/load")
+def grid_load():
+    current_hour = datetime.now().hour
+    zones = [
+        "Koramangala", "Whitefield", "Electronic City", "Indiranagar",
+        "HSR Layout", "Marathahalli", "Jayanagar", "Yelahanka",
+        "BTM Layout", "Rajajinagar", "Hebbal", "MG Road",
+    ]
+    result = []
+    for zone in zones:
+        base = 45 + random.gauss(0, 5)
+        morning = 25 * math.exp(-0.5 * ((current_hour - 8) / 1.5) ** 2)
+        evening = 35 * math.exp(-0.5 * ((current_hour - 19) / 1.8) ** 2)
+        load    = min(100, max(10, base + morning + evening + random.gauss(0, 3)))
+        surplus = 100 - load
+        result.append({
+            "zone":        zone,
+            "load_pct":    round(load, 1),
+            "surplus_pct": round(surplus, 1),
+            "status":      "near-peak" if load > 75 else ("normal" if load > 40 else "low-load"),
+            "timestamp":   datetime.now().isoformat(),
+            "ev_charging_recommended": surplus > 40,
+        })
+    return result
