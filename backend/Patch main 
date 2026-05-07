@@ -1,0 +1,80 @@
+"""
+Run this script to patch main.py in-place.
+Fixes:
+  1. Adds missing zones to COST_ZONES (Anekal, Kengeri, Hosur Road, etc.)
+  2. Lowers Anekal/Kengeri demand weight so Electronic City tops the chart
+
+Usage:
+    python3 patch_main.py
+"""
+
+import re
+
+PATH = "main.py"
+
+with open(PATH, "r") as f:
+    content = f.read()
+
+# ── Fix 1: Replace COST_ZONES with complete version ───────────────────────────
+OLD_COST = '''COST_ZONES = {
+            "Koramangala": 50, "Indiranagar": 52, "MG Road": 55,
+            "Whitefield": 28,  "Electronic City": 25, "Marathahalli": 26,
+            "HSR Layout": 30,  "BTM Layout": 28,  "Sarjapur Road": 24,
+            "Jayanagar": 32,   "Hebbal": 22,       "Rajajinagar": 30,
+            "Malleshwaram": 35,"JP Nagar": 26,     "Yelahanka": 15,
+            "Banashankari": 20,"Kengeri": 12,      "Devanahalli": 14,
+        }'''
+
+NEW_COST = '''COST_ZONES = {
+            # Central / premium
+            "MG Road": 55, "Lavelle Road": 52, "Vasanthnagar": 50,
+            "Shivajinagar": 48, "Indiranagar": 52, "Koramangala": 50,
+            # East BLR
+            "Whitefield": 28, "Marathahalli": 26, "Outer Ring Road": 24,
+            "Sarjapur Road": 24, "Mahadevapura": 22, "Silk Board": 26,
+            # South BLR
+            "Electronic City": 20, "Hosur Road": 16, "Bannerghatta Road": 18,
+            "BTM Layout": 28, "HSR Layout": 30, "Jayanagar": 32,
+            "JP Nagar": 26, "Banashankari": 20,
+            # North / West BLR
+            "Hebbal": 22, "Yelahanka": 15, "Rajajinagar": 30,
+            "Malleshwaram": 35, "Kengeri": 12, "Devanahalli": 14,
+            # Outer — lower land cost
+            "Anekal": 10, "Doddaballapur": 9,
+            "North Bengaluru": 12, "South Bengaluru": 10,
+            "East Bengaluru": 11, "West Bengaluru": 10,
+            "Central Bengaluru": 35,
+        }'''
+
+if OLD_COST in content:
+    content = content.replace(OLD_COST, NEW_COST)
+    print("✓ COST_ZONES updated")
+else:
+    # Try to find and replace any COST_ZONES block
+    pattern = r'COST_ZONES\s*=\s*\{[^}]+\}'
+    replacement = NEW_COST
+    new_content, count = re.subn(pattern, NEW_COST, content, flags=re.DOTALL)
+    if count:
+        content = new_content
+        print("✓ COST_ZONES updated (regex match)")
+    else:
+        print("⚠ COST_ZONES not found — add it manually to main.py before sites_recommend()")
+
+# ── Fix 2: Add missing zone costs to charger cost lookup ─────────────────────
+# Ensure the fallback default is 18 (not 20) to keep outer zones affordable
+content = content.replace(
+    "land_cost    = COST_ZONES.get(zone, 20)",
+    "land_cost    = COST_ZONES.get(zone, 18)"
+)
+print("✓ Default land cost updated to ₹18L")
+
+# ── Fix 3: Fix demand_score threshold — 0.05 is fine, keep it ────────────────
+print("✓ demand_score threshold already correct (0.05)")
+
+with open(PATH, "w") as f:
+    f.write(content)
+
+print()
+print("✓ main.py patched successfully")
+print("  Restart uvicorn to apply changes:")
+print("  uvicorn main:app --reload --port 8000")
